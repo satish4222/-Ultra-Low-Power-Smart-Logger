@@ -1,0 +1,267 @@
+code
+#define BLYNK_TEMPLATE_ID "TMPL38Jz0zyHv"
+#define BLYNK_TEMPLATE_NAME "Device AuthToken"
+#define BLYNK_AUTH_TOKEN "oe1qMp-ZDoXS-zcm0Godj2inZGFHtNxf"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <ArduinoOTA.h>
+#include <SD.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
+#include <WebServer.h>
+#include <time.h>
+
+// Wi-Fi credentials
+char ssid[] = "Venkatesh";
+char pass[] = "Venky9678";
+
+// OTA password
+const char* otaPassword = "OTA_Password";
+
+// Pin definitions
+#define SD_CS        5    // SD card chip select
+#define PIR_PIN      14   // PIR sensor output
+#define BATTERY_PIN  35   // ADC for battery voltage
+
+// Sleep settings
+#define uS_TO_S_FACTOR 1000000ULL
+#define TIME_TO_SLEEP 43200 // 12 hours
+
+// Battery voltage divider
+const float voltageDividerRatio = 2.0; // 100k/100k
+const float LOW_BATTERY_THRESHOLD = 3.3;
+
+RTC_DATA_ATTR int lastNTPSyncDay = -1;
+
+Adafruit_BMP280 bmp;
+WebServer server(80);
+
+volatile bool motionDetected = false;
+char auth[] = BLYNK_AUTH_TOKEN;
+
+// Interrupt for PIR
+void IRAM_ATTR handleMotionInterrupt() {
+  motionDetected = true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // PIR setup
+  pinMode(PIR_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(PIR_PIN), handleMotionInterrupt, RISING);
+
+  // SD init
+  if (!SD.begin(SD_CS)) Serial.println("SD Card initialization failed!");
+  else Serial.println("SD Card initialized.");
+
+  // BMP280 sensor
+  if (!bmp.begin(0x76)) Serial.println("BMP280 sensor not found!");
+  else {
+    bmp.setSampling(Adafruit_BMP280::MODE_FORCED, Adafruit_BMP280::SAMPLING_X2,
+                    Adafruit_BMP280::SAMPLING_X16, Adafruit_BMP280::FILTER_X16,
+                    Adafruit_BMP280::STANDBY_MS_500);
+  }
+
+  analogReadResolution(12);
+
+  // Wakeup cause
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  Serial.printf("Wakeup reason: %d\n", wakeup_reason);
+
+  // Sleep sources
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)PIR_PIN, 1);
+  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+
+  // Battery check
+  if (readBatteryVoltage() < LOW_BATTERY_THRESHOLD) {
+    Serial.println("Warning: Low Battery Voltage!");
+  }
+
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0 && !motionDetected) motionDetected = true;
+
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
+    connectWiFi();
+
+    if (isTimeToSync()) {
+      syncTime();
+      Serial.println("NTP time synchronized.");
+    }
+
+    Blynk.begin(auth, ssid, pass);
+    setupOTA();
+    setupWebServer();
+
+    logSensorData(false);
+
+    unsigned long start = millis();
+    while (millis() - start < 10000) {
+      Blynk.run();
+      ArduinoOTA.handle();
+      server.handleClient();
+      delay(10);
+    }
+
+    Blynk.disconnect();
+    disconnectWiFi();
+  } else if (motionDetected) {
+    connectWiFi();
+    Blynk.begin(auth, ssid, pass);
+
+    logSensorData(true);
+
+    unsigned long start = millis();
+    while (millis() - start < 5000) {
+      Blynk.run();
+      ArduinoOTA.handle();
+      server.handleClient();
+      delay(10);
+    }
+
+    Blynk.disconnect();
+    disconnectWiFi();
+  } else {
+    logSensorData(false);
+  }
+
+  Serial.println("Entering deep sleep...");
+  delay(500);
+  enterDeepSleep();
+}
+
+void loop() {
+  Blynk.run();
+  ArduinoOTA.handle();
+  server.handleClient();
+}
+
+// ====== Supporting Functions ======
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+  Serial.print("Connecting to WiFi");
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) Serial.println("WiFi connected");
+  else Serial.println("Failed to connect WiFi");
+}
+
+void disconnectWiFi() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  Serial.println("WiFi disconnected");
+}
+
+bool isTimeToSync() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to get local time.");
+    return false;
+  }
+  return (timeinfo.tm_yday != lastNTPSyncDay);
+}
+
+void syncTime() {
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) lastNTPSyncDay = timeinfo.tm_yday;
+}
+
+float readBatteryVoltage() {
+  int raw = analogRead(BATTERY_PIN);
+  float voltage = ((float)raw / 4095.0) * 3.3 * voltageDividerRatio;
+  Serial.printf("Battery voltage: %.2f V\n", voltage);
+  return voltage;
+}
+
+// OTA
+void setupOTA() {
+  ArduinoOTA.setHostname("ESP32_DataLogger");
+  ArduinoOTA.setPassword(otaPassword);
+  ArduinoOTA.begin();
+  Serial.println("OTA Initialized");
+}
+
+// Web diagnostics
+void setupWebServer() {
+  server.on("/", handleRoot);
+  server.begin();
+  Serial.println("WebServer started");
+}
+void handleRoot() {
+  String response = "ESP32 Data Logger\n";
+  response += "Battery Voltage: " + String(readBatteryVoltage()) + " V\n";
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  response += "Last Wakeup Cause: " + String(cause) + "\n";
+  response += "Free Heap: " + String(ESP.getFreeHeap()) + " bytes\n";
+  server.send(200, "text/plain", response);
+}
+
+// Timestamp helpers
+String getDateString() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "00/00/0000";
+  char dateStr[11];
+  strftime(dateStr, sizeof(dateStr), "%d/%m/%Y", &timeinfo);
+  return String(dateStr);
+}
+String getTimeString() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "00:00:00";
+  char timeStr[9];
+  strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
+  return String(timeStr);
+}
+
+// Logging and Blynk push
+void logSensorData(bool motionWake) {
+  Serial.println("Starting sensor reading and logging...");
+  bmp.takeForcedMeasurement();
+  float temperature = bmp.readTemperature();
+  float pressure = bmp.readPressure() / 100.0F; // hPa
+  float batteryVoltage = readBatteryVoltage();
+
+  String dateStr = getDateString();
+  String timeStr = getTimeString();
+
+  File logFile = SD.open("/log.txt", FILE_APPEND);
+  if (!logFile) {
+    Serial.println("Failed to open log file");
+    return;
+  }
+  String logEntry = "Date: " + dateStr + ", ";
+  logEntry += "Time: " + timeStr + ", ";
+  logEntry += "Motion: " + String(motionWake ? "1" : "0") + ", ";
+  logEntry += "Temperature: " + String(temperature, 2) + " celcius, ";
+  logEntry += "pressure: " + String(pressure, 2) + ", ";
+  logEntry += "voltage:" + String(batteryVoltage, 2) + "V\n";
+
+  logFile.print(logEntry);
+  logFile.close();
+
+  Serial.print("Logged: ");
+  Serial.print(logEntry);
+
+  // Send to Blynk virtual pins
+  Blynk.virtualWrite(V0, temperature);
+  Blynk.virtualWrite(V1, pressure);
+  Blynk.virtualWrite(V2, batteryVoltage);
+  Blynk.virtualWrite(V3, motionWake ? 1 : 0);
+}
+
+void enterDeepSleep() {
+  motionDetected = false;
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)PIR_PIN, 1);
+  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+  Serial.flush();
+  esp_deep_sleep_start();
+}
